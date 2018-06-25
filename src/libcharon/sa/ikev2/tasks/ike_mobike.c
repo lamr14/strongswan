@@ -76,6 +76,11 @@ struct private_ike_mobike_t {
 	 * additional addresses got updated
 	 */
 	bool addresses_updated;
+
+	/**
+	 * Whether we already handled the first IKE_AUTH message
+	 */
+	bool first_auth;
 };
 
 /**
@@ -414,11 +419,12 @@ METHOD(ike_mobike_t, transmit, bool,
 METHOD(task_t, build_i, status_t,
 	   private_ike_mobike_t *this, message_t *message)
 {
-	if (message->get_exchange_type(message) == IKE_AUTH &&
-		message->get_message_id(message) == 1)
+	if (!this->first_auth &&
+		message->get_exchange_type(message) == IKE_AUTH)
 	{	/* only in first IKE_AUTH */
 		message->add_notify(message, FALSE, MOBIKE_SUPPORTED, chunk_empty);
 		build_address_list(this, message);
+		this->first_auth = TRUE;
 	}
 	else if (message->get_exchange_type(message) == INFORMATIONAL)
 	{
@@ -465,10 +471,11 @@ METHOD(task_t, build_i, status_t,
 METHOD(task_t, process_r, status_t,
 	   private_ike_mobike_t *this, message_t *message)
 {
-	if (message->get_exchange_type(message) == IKE_AUTH &&
-		message->get_message_id(message) == 1)
+	if (!this->first_auth &&
+		message->get_exchange_type(message) == IKE_AUTH)
 	{	/* only first IKE_AUTH */
 		process_payloads(this, message);
+		this->first_auth = TRUE;
 	}
 	else if (message->get_exchange_type(message) == INFORMATIONAL)
 	{
@@ -509,7 +516,7 @@ METHOD(task_t, build_r, status_t,
 {
 	if (message->get_exchange_type(message) == IKE_AUTH &&
 		this->ike_sa->get_state(this->ike_sa) == IKE_ESTABLISHED)
-	{
+	{	/* in last IKE_AUTH only */
 		if (this->ike_sa->supports_extension(this->ike_sa, EXT_MOBIKE))
 		{
 			message->add_notify(message, FALSE, MOBIKE_SUPPORTED, chunk_empty);
@@ -542,7 +549,7 @@ METHOD(task_t, process_i, status_t,
 {
 	if (message->get_exchange_type(message) == IKE_AUTH &&
 		this->ike_sa->get_state(this->ike_sa) == IKE_ESTABLISHED)
-	{
+	{	/* in last IKE_AUTH only */
 		process_payloads(this, message);
 		return SUCCESS;
 	}
@@ -681,6 +688,7 @@ METHOD(task_t, migrate, void,
 	{
 		this->natd->task.migrate(&this->natd->task, ike_sa);
 	}
+	this->first_auth = FALSE;
 }
 
 METHOD(task_t, destroy, void,
