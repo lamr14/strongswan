@@ -202,6 +202,11 @@ struct private_child_create_t {
 	 * whether we are retrying with another DH group
 	 */
 	bool retry;
+
+	/**
+	 * Whether we already handled the first IKE_AUTH message
+	 */
+	bool first_auth;
 };
 
 /**
@@ -1050,14 +1055,15 @@ METHOD(task_t, build_i, status_t,
 			}
 			break;
 		case IKE_AUTH:
-			if (message->get_message_id(message) != 1)
+			if (!this->first_auth)
 			{
 				/* send only in the first request, not in subsequent rounds */
-				return NEED_MORE;
+				this->first_auth = TRUE;
+				break;
 			}
-			break;
+			/* fall-through */
 		default:
-			break;
+			return NEED_MORE;
 	}
 
 	/* check if we want a virtual IP, but don't have one */
@@ -1188,13 +1194,15 @@ METHOD(task_t, process_r, status_t,
 			get_nonce(message, &this->other_nonce);
 			break;
 		case IKE_AUTH:
-			if (message->get_message_id(message) != 1)
+			if (!this->first_auth)
 			{
 				/* only handle first AUTH payload, not additional rounds */
-				return NEED_MORE;
+				this->first_auth = TRUE;
+				break;
 			}
+			/* fall-through */
 		default:
-			break;
+			return NEED_MORE;
 	}
 
 	process_payloads(this, message);
@@ -1335,8 +1343,9 @@ METHOD(task_t, build_r, status_t,
 				return SUCCESS;
 			}
 			ike_auth = TRUE;
-		default:
 			break;
+		default:
+			return NEED_MORE;
 	}
 
 	if (this->ike_sa->get_state(this->ike_sa) == IKE_REKEYING)
@@ -1518,8 +1527,9 @@ METHOD(task_t, process_i, status_t,
 				return NEED_MORE;
 			}
 			ike_auth = TRUE;
-		default:
 			break;
+		default:
+			return NEED_MORE;
 	}
 
 	/* check for erroneous notifies */
@@ -1749,6 +1759,7 @@ METHOD(task_t, migrate, void,
 	this->mark_in = 0;
 	this->mark_out = 0;
 	this->established = FALSE;
+	this->first_auth = FALSE;
 }
 
 METHOD(task_t, destroy, void,
