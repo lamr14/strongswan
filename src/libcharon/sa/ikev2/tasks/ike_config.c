@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2012-2018 Tobias Brunner
  * Copyright (C) 2007 Martin Willi
  * Copyright (C) 2006-2007 Fabian Hartmann, Noah Heusser
  * HSR Hochschule fuer Technik Rapperswil
@@ -50,6 +51,11 @@ struct private_ike_config_t {
 	 * list of attributes requested and its handler, entry_t
 	 */
 	linked_list_t *requested;
+
+	/**
+	 * Whether we already handled the first IKE_AUTH message
+	 */
+	bool first_auth;
 };
 
 /**
@@ -228,7 +234,8 @@ static void process_payloads(private_ike_config_t *this, message_t *message)
 METHOD(task_t, build_i, status_t,
 	private_ike_config_t *this, message_t *message)
 {
-	if (message->get_message_id(message) == 1)
+	if (!this->first_auth &&
+		message->get_exchange_type(message) == IKE_AUTH)
 	{	/* in first IKE_AUTH only */
 		cp_payload_t *cp = NULL;
 		enumerator_t *enumerator;
@@ -238,6 +245,8 @@ METHOD(task_t, build_i, status_t,
 		chunk_t data;
 		linked_list_t *vips;
 		host_t *host;
+
+		this->first_auth = TRUE;
 
 		vips = linked_list_create();
 
@@ -312,9 +321,11 @@ METHOD(task_t, build_i, status_t,
 METHOD(task_t, process_r, status_t,
 	private_ike_config_t *this, message_t *message)
 {
-	if (message->get_message_id(message) == 1)
+	if (!this->first_auth &&
+		message->get_exchange_type(message) == IKE_AUTH)
 	{	/* in first IKE_AUTH only */
 		process_payloads(this, message);
+		this->first_auth = TRUE;
 	}
 	return NEED_MORE;
 }
@@ -469,6 +480,7 @@ METHOD(task_t, migrate, void,
 	this->vips = linked_list_create();
 	this->requested->destroy_function(this->requested, free);
 	this->requested = linked_list_create();
+	this->first_auth = FALSE;
 }
 
 METHOD(task_t, destroy, void,
