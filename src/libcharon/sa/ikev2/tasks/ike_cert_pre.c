@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008 Tobias Brunner
+ * Copyright (C) 2008-2018 Tobias Brunner
  * Copyright (C) 2006-2009 Martin Willi
  * HSR Hochschule fuer Technik Rapperswil
  *
@@ -51,9 +51,14 @@ struct private_ike_cert_pre_t {
 	bool do_http_lookup;
 
 	/**
-	 * whether this is the final authentication round
+	 * Whether this is the final authentication round
 	 */
 	bool final;
+
+	/**
+	 * Whether we already sent certificate requests
+	 */
+	bool certreqs_sent;
 };
 
 /**
@@ -468,24 +473,18 @@ static void build_certreqs(private_ike_cert_pre_t *this, message_t *message)
  */
 static bool final_auth(message_t *message)
 {
-	/* we check for an AUTH payload without a ANOTHER_AUTH_FOLLOWS notify */
-	if (message->get_payload(message, PLV2_AUTH) == NULL)
-	{
-		return FALSE;
-	}
-	if (message->get_notify(message, ANOTHER_AUTH_FOLLOWS))
-	{
-		return FALSE;
-	}
-	return TRUE;
+	return message->get_payload(message, PLV2_AUTH) != NULL &&
+		   !message->get_notify(message, ANOTHER_AUTH_FOLLOWS);
 }
 
 METHOD(task_t, build_i, status_t,
 	private_ike_cert_pre_t *this, message_t *message)
 {
-	if (message->get_message_id(message) == 1)
+	if (!this->certreqs_sent &&
+		message->get_exchange_type(message) == IKE_AUTH)
 	{	/* initiator sends CERTREQs in first IKE_AUTH */
 		build_certreqs(this, message);
+		this->certreqs_sent = TRUE;
 	}
 	return NEED_MORE;
 }
@@ -493,12 +492,12 @@ METHOD(task_t, build_i, status_t,
 METHOD(task_t, process_r, status_t,
 	private_ike_cert_pre_t *this, message_t *message)
 {
-	if (message->get_exchange_type(message) != IKE_SA_INIT)
+	if (message->get_exchange_type(message) == IKE_AUTH)
 	{	/* handle certreqs/certs in any IKE_AUTH, just in case */
 		process_certreqs(this, message);
 		process_certs(this, message);
+		this->final = final_auth(message);
 	}
-	this->final = final_auth(message);
 	return NEED_MORE;
 }
 
@@ -519,15 +518,20 @@ METHOD(task_t, build_r, status_t,
 METHOD(task_t, process_i, status_t,
 	private_ike_cert_pre_t *this, message_t *message)
 {
-	if (message->get_exchange_type(message) == IKE_SA_INIT)
+	switch (message->get_exchange_type(message))
 	{
-		process_certreqs(this, message);
-	}
-	process_certs(this, message);
-
-	if (final_auth(message))
-	{
-		return SUCCESS;
+		case IKE_SA_INIT:
+			process_certreqs(this, message);
+			break;
+		case IKE_AUTH:
+			process_certs(this, message);
+			if (final_auth(message))
+			{
+				return SUCCESS;
+			}
+			break;
+		default:
+			break;
 	}
 	return NEED_MORE;
 }
@@ -542,6 +546,9 @@ METHOD(task_t, migrate, void,
 	private_ike_cert_pre_t *this, ike_sa_t *ike_sa)
 {
 	this->ike_sa = ike_sa;
+
+	this->final = FALSE;
+	this->certreqs_sent = FALSE;
 }
 
 METHOD(task_t, destroy, void,
