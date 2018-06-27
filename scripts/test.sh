@@ -37,6 +37,8 @@ all|coverage)
 			--disable-systemd --disable-soup --disable-unwind-backtraces
 			--disable-svc --disable-dbghelp-backtraces --disable-socket-win
 			--disable-kernel-wfp --disable-kernel-iph --disable-winhttp"
+	# liboqs would have to be installed manually
+	CONFIG="$CONFIG --disable-oqs"
 	# Ubuntu 14.04 does provide a too old libtss2-dev
 	CONFIG="$CONFIG --disable-tss-tss2"
 	# Ubuntu 14.04 does not provide libnm
