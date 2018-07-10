@@ -17,6 +17,7 @@
 #include "keymat_v2.h"
 
 #include <daemon.h>
+#include <bio/bio_writer.h>
 #include <crypto/prf_plus.h>
 #include <crypto/hashers/hash_algorithm_set.h>
 
@@ -76,7 +77,32 @@ struct private_keymat_v2_t {
 	 * Set of hash algorithms supported by peer for signature authentication
 	 */
 	hash_algorithm_set_t *hash_algorithms;
+
+	/**
+	 * Initial pcket data to be used in auth octets
+	 */
+	array_t *packets;
 };
+
+/**
+ * Data for an initial packet
+ */
+typedef struct {
+	/** Message ID */
+	uint32_t mid;
+	/** Fragment number */
+	uint16_t fnr;
+	/** Whether the packet was sent, or received */
+	bool sent;
+	/** Actual data */
+	chunk_t data;
+} packet_data_t;
+
+static void packet_destroy(packet_data_t *this)
+{
+	chunk_free(&this->data);
+	free(this);
+}
 
 METHOD(keymat_t, get_version, ike_version_t,
 	private_keymat_v2_t *this)
@@ -652,8 +678,92 @@ METHOD(keymat_t, get_aead, aead_t*,
 	return in ? this->aead_in : this->aead_out;
 }
 
+METHOD(keymat_v2_t, add_packet, void,
+	private_keymat_v2_t *this, bool sent, uint32_t mid, uint16_t fnr,
+	chunk_t data)
+{
+	packet_data_t *packet;
+	int i, insert_at = -1;
+
+	for (i = 0; i < array_count(this->packets); i++)
+	{
+		array_get(this->packets, i, &packet);
+		if (packet->sent != sent)
+		{
+			continue;
+		}
+		if (packet->mid == mid)
+		{
+			if (packet->fnr == fnr)
+			{
+				/* replace current data */
+				chunk_free(&packet->data);
+				packet->data = chunk_clone(data);
+				return;
+			}
+			if (packet->fnr > fnr)
+			{
+				insert_at = i;
+				break;
+			}
+			continue;
+		}
+		if (packet->mid > mid)
+		{
+			insert_at = i;
+			break;
+		}
+	}
+	INIT(packet,
+		.mid = mid,
+		.fnr = fnr,
+		.sent = sent,
+		.data = chunk_clone(data),
+	);
+	array_insert_create(&this->packets, insert_at, packet);
+}
+
+METHOD(keymat_v2_t, get_packets, chunk_t,
+	private_keymat_v2_t *this, bool sent)
+{
+	packet_data_t *packet;
+	bio_writer_t *writer;
+	chunk_t data;
+	uint32_t len = 0;
+	int i;
+
+	for (i = 0; i < array_count(this->packets); i++)
+	{
+		array_get(this->packets, i, &packet);
+		if (packet->sent == sent)
+		{
+			len += packet->data.len;
+		}
+	}
+
+	writer = bio_writer_create(len);
+	for (i = 0; i < array_count(this->packets); i++)
+	{
+		array_get(this->packets, i, &packet);
+		if (packet->sent == sent)
+		{
+			writer->write_data(writer, packet->data);
+		}
+	}
+	data = writer->extract_buf(writer);
+	writer->destroy(writer);
+	return data;
+}
+
+METHOD(keymat_v2_t, clear_packets, void,
+	private_keymat_v2_t *this)
+{
+	array_destroy_function(this->packets, (void*)packet_destroy, NULL);
+	this->packets = NULL;
+}
+
 METHOD(keymat_v2_t, get_auth_octets, bool,
-	private_keymat_v2_t *this, bool verify, chunk_t ike_sa_init,
+	private_keymat_v2_t *this, bool verify, chunk_t packets,
 	chunk_t nonce, identification_t *id, char reserved[3], chunk_t *octets,
 	array_t *schemes)
 {
@@ -674,7 +784,7 @@ METHOD(keymat_v2_t, get_auth_octets, bool,
 	{
 		return FALSE;
 	}
-	*octets = chunk_cat("ccm", ike_sa_init, nonce, chunk);
+	*octets = chunk_cat("ccm", packets, nonce, chunk);
 	DBG3(DBG_IKE, "octets = message + nonce + prf(Sk_px, IDx') %B", octets);
 	return TRUE;
 }
@@ -686,7 +796,7 @@ METHOD(keymat_v2_t, get_auth_octets, bool,
 #define IKEV2_KEY_PAD_LENGTH 17
 
 METHOD(keymat_v2_t, get_psk_sig, bool,
-	private_keymat_v2_t *this, bool verify, chunk_t ike_sa_init, chunk_t nonce,
+	private_keymat_v2_t *this, bool verify, chunk_t packets, chunk_t nonce,
 	chunk_t secret, identification_t *id, char reserved[3], chunk_t *sig)
 {
 	chunk_t key_pad, key, octets;
@@ -695,7 +805,7 @@ METHOD(keymat_v2_t, get_psk_sig, bool,
 	{	/* EAP uses SK_p if no MSK has been established */
 		secret = verify ? this->skp_verify : this->skp_build;
 	}
-	if (!get_auth_octets(this, verify, ike_sa_init, nonce, id, reserved,
+	if (!get_auth_octets(this, verify, packets, nonce, id, reserved,
 						 &octets, NULL))
 	{
 		return FALSE;
@@ -747,6 +857,7 @@ METHOD(keymat_v2_t, add_hash_algorithm, void,
 METHOD(keymat_t, destroy, void,
 	private_keymat_v2_t *this)
 {
+	clear_packets(this);
 	DESTROY_IF(this->aead_in);
 	DESTROY_IF(this->aead_out);
 	DESTROY_IF(this->prf);
@@ -777,6 +888,9 @@ keymat_v2_t *keymat_v2_create(bool initiator)
 			.derive_ike_keys = _derive_ike_keys,
 			.derive_child_keys = _derive_child_keys,
 			.get_skd = _get_skd,
+			.add_packet = _add_packet,
+			.get_packets = _get_packets,
+			.clear_packets = _clear_packets,
 			.get_auth_octets = _get_auth_octets,
 			.get_psk_sig = _get_psk_sig,
 			.add_hash_algorithm = _add_hash_algorithm,

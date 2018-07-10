@@ -20,6 +20,7 @@
 
 #include <collections/array.h>
 #include <daemon.h>
+#include <sa/ikev2/keymat_v2.h>
 #include <sa/ikev2/tasks/ike_init.h>
 #include <sa/ikev2/tasks/ike_natd.h>
 #include <sa/ikev2/tasks/ike_mobike.h>
@@ -40,6 +41,7 @@
 #include <sa/ikev2/tasks/child_create.h>
 #include <sa/ikev2/tasks/child_rekey.h>
 #include <sa/ikev2/tasks/child_delete.h>
+#include <encoding/payloads/encrypted_fragment_payload.h>
 #include <encoding/payloads/delete_payload.h>
 #include <encoding/payloads/unknown_payload.h>
 #include <processing/jobs/retransmit_job.h>
@@ -310,15 +312,29 @@ static bool generate_message(private_task_manager_t *this, message_t *message,
 {
 	enumerator_t *fragments;
 	packet_t *fragment;
+	keymat_v2_t *keymat = NULL;
+	uint16_t fnr = 1;
 
 	if (this->ike_sa->generate_message_fragmented(this->ike_sa, message,
 												  &fragments) != SUCCESS)
 	{
 		return FALSE;
 	}
+	/* collect IKE_SA_INIT and IKE_AUX while connecting */
+	if (message->get_exchange_type(message) == IKE_SA_INIT ||
+		(message->get_exchange_type(message) == IKE_AUX &&
+		 this->ike_sa->get_state(this->ike_sa) == IKE_CONNECTING))
+	{
+		keymat = (keymat_v2_t*)this->ike_sa->get_keymat(this->ike_sa);
+	}
 	while (fragments->enumerate(fragments, &fragment))
 	{
 		array_insert_create(packets, ARRAY_TAIL, fragment);
+		if (keymat)
+		{
+			keymat->add_packet(keymat, TRUE, message->get_message_id(message),
+							   fnr++, fragment->get_data(fragment));
+		}
 	}
 	fragments->destroy(fragments);
 	array_compress(*packets);
@@ -1307,16 +1323,36 @@ METHOD(task_manager_t, get_mid, uint32_t,
  *
  * Returns SUCCESS if the message is not a fragment, and NEED_MORE if it was
  * handled properly.  Error states are  returned if the fragment was invalid or
- * the reassembled message could not have been processed properly.
+ * the reassembled message could not be processed properly.
  */
 static status_t handle_fragment(private_task_manager_t *this,
 								message_t **defrag, message_t *msg)
 {
+	encrypted_fragment_payload_t *fragment;
 	message_t *reassembled;
+	keymat_v2_t *keymat = NULL;
 	status_t status;
 
-	if (!msg->get_payload(msg, PLV2_FRAGMENT))
+	/* collect IKE_SA_INIT and IKE_AUX while connecting */
+	if (msg->get_exchange_type(msg) == IKE_SA_INIT ||
+		(msg->get_exchange_type(msg) == IKE_AUX &&
+		 this->ike_sa->get_state(this->ike_sa) == IKE_CONNECTING))
 	{
+		keymat = (keymat_v2_t*)this->ike_sa->get_keymat(this->ike_sa);
+	}
+	fragment = (encrypted_fragment_payload_t*)msg->get_payload(msg,
+															   PLV2_FRAGMENT);
+	if (!fragment)
+	{
+		if (msg == *defrag)
+		{	/* ignore reassembled messages, we collect only the fragments */
+			return SUCCESS;
+		}
+		if (keymat)
+		{
+			keymat->add_packet(keymat, FALSE, msg->get_message_id(msg), 1,
+							   msg->get_packet_data(msg));
+		}
 		return SUCCESS;
 	}
 	if (!*defrag)
@@ -1327,18 +1363,26 @@ static status_t handle_fragment(private_task_manager_t *this,
 			return FAILED;
 		}
 	}
+
 	status = (*defrag)->add_fragment(*defrag, msg);
+
+	if (keymat && (status == NEED_MORE || status == SUCCESS))
+	{
+		keymat->add_packet(keymat, FALSE, msg->get_message_id(msg),
+						   fragment->get_fragment_number(fragment),
+						   msg->get_packet_data(msg));
+	}
 	if (status == SUCCESS)
 	{
 		/* reinject the reassembled message */
 		reassembled = *defrag;
-		*defrag = NULL;
 		status = this->ike_sa->process_message(this->ike_sa, reassembled);
 		if (status == SUCCESS)
 		{
 			/* avoid processing the last fragment */
 			status = NEED_MORE;
 		}
+		*defrag = NULL;
 		reassembled->destroy(reassembled);
 	}
 	return status;
